@@ -1,0 +1,16 @@
+[Unit]
+Description=EVA BLE GATT Peripheral Server
+After=bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+ExecStartPre=/bin/sh -c 'touch /run/pal.events && chmod 666 /run/pal.events'
+ExecStart=/usr/bin/python3 /home/ikcekis/pal/ble_server.py
+WorkingDirectory=/home/ikcekis/pal
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
