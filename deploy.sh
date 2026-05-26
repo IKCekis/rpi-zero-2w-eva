@@ -9,6 +9,9 @@ echo "→ Deploying to $HOST:$REMOTE_DIR"
 rsync -avz --exclude "__pycache__" --exclude "*.pyc" --exclude ".git" \
     ./ "$HOST:$REMOTE_DIR/"
 
+echo "→ Installing system deps"
+ssh "$HOST" "sudo apt-get install -y python3-dbus bluez"
+
 echo "→ Installing Python deps (root)"
 ssh "$HOST" "sudo pip3 install -r $REMOTE_DIR/requirements.txt --break-system-packages"
 

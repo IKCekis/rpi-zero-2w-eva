@@ -13,6 +13,7 @@ Run as root (required for bluezero GATT peripheral):
     sudo python3 ble_server.py
 
 Requires:
+    sudo apt install python3-dbus
     pip3 install bluezero
     sudo systemctl enable --now bluetooth
 """
@@ -26,6 +27,13 @@ import threading
 from pathlib import Path
 
 from bluezero import peripheral, adapter
+
+try:
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+except Exception:  # pragma: no cover - only available on the Pi/BlueZ runtime
+    dbus = None
 
 log = logging.getLogger("ble_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -42,6 +50,54 @@ PREFS_FILE = Path('/run/pal.prefs.json')
 # ── Internal state ────────────────────────────────────────────────────────────
 _prefs_bytes: list[int] = []
 _lock = threading.Lock()
+_pairing_agent = None
+_system_bus = None
+
+
+if dbus is not None:
+    class AutoPairingAgent(dbus.service.Object):
+        """BlueZ agent that accepts Just Works pairing from the phone."""
+
+        def __init__(self, bus, path: str) -> None:
+            super().__init__(bus, path)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='', out_signature='')
+        def Release(self) -> None:
+            log.info("BlueZ pairing agent released")
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='o', out_signature='s')
+        def RequestPinCode(self, device) -> str:
+            log.info("Pairing PIN requested by %s; using 0000", device)
+            return '0000'
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='os', out_signature='')
+        def DisplayPinCode(self, device, pincode) -> None:
+            log.info("Pairing PIN for %s: %s", device, pincode)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='o', out_signature='u')
+        def RequestPasskey(self, device) -> int:
+            log.info("Pairing passkey requested by %s; using 000000", device)
+            return dbus.UInt32(0)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='ouq', out_signature='')
+        def DisplayPasskey(self, device, passkey, entered) -> None:
+            log.info("Pairing passkey for %s: %06d (%d entered)", device, passkey, entered)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='ou', out_signature='')
+        def RequestConfirmation(self, device, passkey) -> None:
+            log.info("Auto-confirming pairing for %s with passkey %06d", device, passkey)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='o', out_signature='')
+        def RequestAuthorization(self, device) -> None:
+            log.info("Authorizing pairing for %s", device)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='os', out_signature='')
+        def AuthorizeService(self, device, uuid) -> None:
+            log.info("Authorizing service %s for %s", uuid, device)
+
+        @dbus.service.method('org.bluez.Agent1', in_signature='', out_signature='')
+        def Cancel(self) -> None:
+            log.info("Pairing request cancelled")
 
 
 def _clear_bonds() -> None:
@@ -61,6 +117,56 @@ def _clear_bonds() -> None:
                 log.info("Removed stale bond: %s", mac)
     except Exception as e:
         log.warning("Bond cleanup error: %s", e)
+
+
+def _register_pairing_agent(adapter_address: str) -> None:
+    """Register a BlueZ Agent1 so phone-side Pair requests are not rejected."""
+    global _pairing_agent, _system_bus
+
+    if dbus is None:
+        log.warning("python3-dbus is unavailable; phone OS pairing may be rejected")
+        return
+
+    try:
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        _system_bus = dbus.SystemBus()
+
+        bluez_root = _system_bus.get_object('org.bluez', '/')
+        manager = dbus.Interface(bluez_root, 'org.freedesktop.DBus.ObjectManager')
+        objects = manager.GetManagedObjects()
+        adapter_path = None
+
+        for path, interfaces in objects.items():
+            adapter_props = interfaces.get('org.bluez.Adapter1')
+            if adapter_props and str(adapter_props.get('Address', '')).upper() == adapter_address.upper():
+                adapter_path = path
+                break
+
+        if adapter_path is None:
+            log.warning("Could not find BlueZ adapter path for %s", adapter_address)
+            return
+
+        adapter_obj = _system_bus.get_object('org.bluez', adapter_path)
+        adapter_props = dbus.Interface(adapter_obj, 'org.freedesktop.DBus.Properties')
+        adapter_props.Set('org.bluez.Adapter1', 'Powered', dbus.Boolean(True))
+        adapter_props.Set('org.bluez.Adapter1', 'Pairable', dbus.Boolean(True))
+        adapter_props.Set('org.bluez.Adapter1', 'Discoverable', dbus.Boolean(True))
+
+        agent_path = '/com/eva/AutoPairingAgent'
+        _pairing_agent = AutoPairingAgent(_system_bus, agent_path)
+        bluez = _system_bus.get_object('org.bluez', '/org/bluez')
+        agent_manager = dbus.Interface(bluez, 'org.bluez.AgentManager1')
+
+        try:
+            agent_manager.RegisterAgent(agent_path, 'NoInputNoOutput')
+        except dbus.exceptions.DBusException as e:
+            if e.get_dbus_name() != 'org.bluez.Error.AlreadyExists':
+                raise
+
+        agent_manager.RequestDefaultAgent(agent_path)
+        log.info("BlueZ auto-pairing agent registered on %s", agent_path)
+    except Exception as e:
+        log.warning("Pairing agent setup failed: %s", e)
 
 
 def _emit(line: str) -> None:
@@ -168,6 +274,7 @@ def main() -> None:
         return
 
     log.info("Using adapter %s", addr)
+    _register_pairing_agent(addr)
 
     pal = peripheral.Peripheral(addr, local_name='EVA-001', appearance=0x0180)
 
