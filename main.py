@@ -10,6 +10,7 @@ Handles BLE events pushed by ble_server.py via /tmp/pal.events:
   ble_activity <type> <json>   — react to specific activities
   ble_game <type> <json>       — react to game outcomes
   ble_prefs <json>             — store prefs (no visual reaction needed)
+  ble_cmd <json>               — generic command; {cmd:"media",state:"music"|"video"|"none"}
 
 Legacy events (still supported):
   feed, pet, play, sleep, speak, poke
@@ -31,7 +32,9 @@ import time
 from pathlib import Path
 
 from pixel_pal import (
-    blank_canvas, draw_face, draw_wave_frame, EXPRESSIONS, W, H,
+    blank_canvas, draw_face, draw_wave_frame,
+    draw_music_frame, draw_video_frame,
+    EXPRESSIONS, W, H,
 )
 
 
@@ -235,6 +238,10 @@ def main():
     wave_pending   = False
     wave_done_at   = 0.0
 
+    # Media mode state
+    media_mode  = 'none'   # 'none' | 'music' | 'video'
+    media_frame = 0
+
     def cleanup(*_):
         driver.close()
         sys.exit(0)
@@ -271,6 +278,8 @@ def main():
             # ── BLE disconnect ────────────────────────────────────────
             elif keyword == 'ble_disconnect':
                 ble_connected = False
+                media_mode  = 'none'
+                media_frame = 0
                 # Play wave animation inline (blocks the loop ~4 s).
                 def go_sleep():
                     nonlocal expr_name, hold_until
@@ -331,6 +340,26 @@ def main():
             elif keyword == 'ble_prefs':
                 pass  # stored by ble_server.py already
 
+            # ── Generic BLE command (includes media mode) ──────────────
+            elif keyword == 'ble_cmd':
+                try:
+                    payload = json.loads(parts[1]) if len(parts) > 1 else {}
+                except Exception:
+                    payload = {}
+                if payload.get('cmd') == 'media':
+                    new_mode = payload.get('state', 'none')
+                    if new_mode != media_mode:
+                        media_mode  = new_mode
+                        media_frame = 0
+                        if media_mode == 'music':
+                            expr_name  = 'singing'
+                            hold_until = now + 1.5
+                        elif media_mode == 'video':
+                            expr_name  = 'excited'
+                            hold_until = now + 1.5
+                        else:
+                            hold_until = 0.0  # drift to ambient immediately
+
             # ── Legacy events ─────────────────────────────────────────
             elif keyword in LEGACY_EVENTS:
                 target, hold, delta = LEGACY_EVENTS[keyword]
@@ -376,10 +405,17 @@ def main():
 
         # 7) Render
         img = blank_canvas()
-        draw_face(img, expr_name,
-                  cy=16 + cy_offset,
-                  blink=blink,
-                  global_look=look)
+        if media_mode == 'music':
+            draw_music_frame(img, media_frame)
+            media_frame += 1
+        elif media_mode == 'video':
+            draw_video_frame(img, media_frame)
+            media_frame += 1
+        else:
+            draw_face(img, expr_name,
+                      cy=16 + cy_offset,
+                      blink=blink,
+                      global_look=look)
         driver.show(img)
 
         # 8) Pace

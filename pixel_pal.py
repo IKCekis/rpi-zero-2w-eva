@@ -345,6 +345,78 @@ def draw_wave_frame(image: Image.Image, frame: int, expr_name: str = "happy") ->
 
 
 # ============================================================
+# Music animation — Eva bobs up/down, notes float right-side.
+# Right of right eye (x≥108) is clear for notes/screen.
+# ============================================================
+
+_MUSIC_BOB = [0, 0, -1, -1, -2, -2, -1, -1, 0, 0, 1, 1, 1, 1, 0, 0]
+_MUSIC_NOTE_SPECS = [(109, 0), (119, 10)]  # (x_anchor, phase_offset)
+
+
+def draw_music_frame(image: Image.Image, frame: int) -> None:
+    """Render one frame of the music-listening animation (looping).
+
+    Eva sings and bobs while two quarter-notes float upward on the right.
+    frame: any int, loops internally.
+    """
+    cy_offset = _MUSIC_BOB[frame % 16]
+    draw_face(image, "singing", cy=16 + cy_offset)
+
+    draw = ImageDraw.Draw(image)
+    for nx, phase in _MUSIC_NOTE_SPECS:
+        # Note scrolls from y=22 up to y=2 over 20 frames
+        note_y = 22 - ((frame + phase) % 20)
+        if 2 <= note_y <= 22:
+            draw.ellipse((nx, note_y + 4, nx + 3, note_y + 6), fill=ON)   # head
+            draw.line((nx + 3, note_y, nx + 3, note_y + 5), fill=ON, width=1)  # stem
+            draw.line((nx + 3, note_y, nx + 5, note_y + 2), fill=ON, width=1)  # flag
+
+
+# ============================================================
+# Video animation — Eva watches a tiny TV on the right.
+# ============================================================
+
+_VIDEO_BOB = [0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+
+
+def draw_video_frame(image: Image.Image, frame: int) -> None:
+    """Render one frame of the video/cinema animation.
+
+    Eva looks right toward a tiny animated TV screen.
+    frame: any int, loops internally.
+    """
+    # Expression classes resolved at call-time so forward refs are fine.
+    phase = frame % 40
+    if phase < 3:
+        expr = "excited"
+    elif phase < 6:
+        expr = "happy"
+    else:
+        # Open eyes looking right + smile — created inline to avoid forward-ref
+        expr = Expression(
+            left_eye=EyeSpec("open", lx=2),
+            right_eye=EyeSpec("open", lx=2),
+            mouth=MouthSpec("smile"),
+        )
+
+    cy_offset = _VIDEO_BOB[frame % 16] // 2
+    draw_face(image, expr, cy=16 + cy_offset)
+
+    draw = ImageDraw.Draw(image)
+    # Small TV screen (x=110..126, y=6..26 clears the right eye at x=85..107)
+    sx1, sy1, sx2, sy2 = 110, 6, 126, 26
+    draw.rectangle((sx1, sy1, sx2, sy2), outline=ON)
+    scan_offset = (frame // 2) % 3
+    for y in range(sy1 + 2, sy2 - 1, 3):
+        if ((y - sy1) // 3 + scan_offset) % 3 == 0:
+            draw.line((sx1 + 2, y, sx2 - 2, y), fill=ON, width=1)
+    # Antenna
+    cx_tv = (sx1 + sx2) // 2
+    draw.line((cx_tv, sy1, cx_tv - 2, sy1 - 4), fill=ON, width=1)
+    draw.line((cx_tv, sy1, cx_tv + 2, sy1 - 4), fill=ON, width=1)
+
+
+# ============================================================
 # Expression presets
 # ============================================================
 
