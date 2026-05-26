@@ -7,7 +7,7 @@ Exposes three characteristics to the phone:
   CMD_CHAR   (write)  — phone sends activity/game/proximity commands
 
 All incoming data is base64-encoded JSON.  On each write this server appends
-a structured event line to /tmp/pal.events so main.py can react.
+a structured event line to /run/pal.events so main.py can react.
 
 Run as root (required for bluezero GATT peripheral):
     sudo python3 ble_server.py
@@ -15,13 +15,13 @@ Run as root (required for bluezero GATT peripheral):
 Requires:
     pip3 install bluezero
     sudo systemctl enable --now bluetooth
-    sudo bluetoothctl power on
 """
 
 from __future__ import annotations
 import json
 import base64
 import logging
+import subprocess
 import threading
 from pathlib import Path
 
@@ -44,10 +44,28 @@ _prefs_bytes: list[int] = []
 _lock = threading.Lock()
 
 
-def _emit(line: str) -> None:
-    """Append one event line to /tmp/pal.events (main.py drains this)."""
+def _clear_bonds() -> None:
+    """Remove any bonded/paired phone devices on startup to prevent OS-level
+    auto-reconnect loops that fight with our app-level GATT connection."""
     try:
-        # Ensure file exists so main.py can open it in r+ mode.
+        out = subprocess.run(
+            ['bluetoothctl', 'devices', 'Paired'],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == 'Device':
+                mac = parts[1]
+                subprocess.run(['bluetoothctl', 'remove', mac],
+                               capture_output=True, timeout=5)
+                log.info("Removed stale bond: %s", mac)
+    except Exception as e:
+        log.warning("Bond cleanup error: %s", e)
+
+
+def _emit(line: str) -> None:
+    """Append one event line to /run/pal.events (main.py drains this)."""
+    try:
         if not EVENT_FILE.exists():
             EVENT_FILE.touch(mode=0o666)
         with open(EVENT_FILE, 'a') as f:
@@ -72,7 +90,6 @@ def read_prefs() -> list[int]:
     with _lock:
         if _prefs_bytes:
             return _prefs_bytes
-    # Load from persisted file if available.
     try:
         data = PREFS_FILE.read_bytes()
         return list(data)
@@ -89,7 +106,6 @@ def write_prefs(value: list[int], options: dict) -> None:
         _prefs_bytes[:] = value
     try:
         PREFS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        log.info("prefs saved to %s", PREFS_FILE)
     except Exception as e:
         log.warning("prefs save error: %s", e)
     _emit(f'ble_prefs {json.dumps(data)}')
@@ -115,15 +131,12 @@ def write_cmd(value: list[int], options: dict) -> None:
     if cmd == 'proximity':
         level = data.get('level', 'medium')
         _emit(f'ble_proximity {level}')
-
     elif cmd == 'activity':
         atype = data.get('type', '')
         _emit(f'ble_activity {atype} {json.dumps(data)}')
-
     elif cmd == 'game':
         gtype = data.get('type', '')
         _emit(f'ble_game {gtype} {json.dumps(data)}')
-
     else:
         _emit(f'ble_cmd {json.dumps(data)}')
 
@@ -143,6 +156,10 @@ def on_disconnect(device_path: str) -> None:
 # ── Build + publish the peripheral ───────────────────────────────────────────
 
 def main() -> None:
+    # Remove any existing bonds so the phone can only connect via GATT (no OS
+    # auto-reconnect loop from a previously created bond).
+    _clear_bonds()
+
     # Grab first available adapter address.
     try:
         addr = list(adapter.Adapter.available())[0].address
@@ -156,7 +173,6 @@ def main() -> None:
 
     pal.add_service(srv_id=1, uuid=EVA_SERVICE_UUID, primary=True)
 
-    # MOOD characteristic — write only from phone side
     pal.add_characteristic(
         srv_id=1, chr_id=1,
         uuid=MOOD_CHAR_UUID,
@@ -168,7 +184,6 @@ def main() -> None:
         notify_callback=None,
     )
 
-    # PREFS characteristic — read/write (phone writes on onboarding, reads on restore)
     pal.add_characteristic(
         srv_id=1, chr_id=2,
         uuid=PREFS_CHAR_UUID,
@@ -180,7 +195,6 @@ def main() -> None:
         notify_callback=None,
     )
 
-    # CMD characteristic — write only
     pal.add_characteristic(
         srv_id=1, chr_id=3,
         uuid=CMD_CHAR_UUID,
@@ -195,7 +209,6 @@ def main() -> None:
     pal.on_connect    = on_connect
     pal.on_disconnect = on_disconnect
 
-    # Ensure event file exists so main.py can open it.
     if not EVENT_FILE.exists():
         EVENT_FILE.touch(mode=0o666)
 
