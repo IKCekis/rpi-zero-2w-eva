@@ -1,24 +1,30 @@
 """
-main.py — Pixel Pal main loop for Raspberry Pi (EVA edition).
+main.py — EVA Pixel Pal main loop (Raspberry Pi, engine edition).
 
-Handles BLE events pushed by ble_server.py via /tmp/pal.events:
+Pi is the single source of truth for all game state.  The mobile app is
+a display-only client; it sends activity commands and receives stat updates.
 
-  ble_connect                  — phone came close → wake animation
-  ble_disconnect               → wave goodbye, then sleep after a delay
-  ble_proximity <level>        — level = close|medium|far
-  ble_mood <mood> <stats_json> — update expression from phone activity
-  ble_activity <type> <json>   — react to specific activities
-  ble_game <type> <json>       — react to game outcomes
-  ble_prefs <json>             — store prefs (no visual reaction needed)
-  ble_cmd <json>               — generic command; {cmd:"media",state:"music"|"video"|"none"}
+BLE events arrive via /run/pal.events (written by ble_server.py):
 
-Legacy events (still supported):
-  feed, pet, play, sleep, speak, poke
+  ble_connect                  — phone connected
+  ble_disconnect               — phone disconnected
+  ble_pin_show <pin>           — show pairing PIN on OLED
+  ble_pin_ok                   — PIN verified → exit PIN display
+  ble_pin_skip                 — saved device → skip PIN display
+  ble_pin_fail                 — wrong PIN → brief angry face
+  ble_proximity <level>        — close|medium|far
+  ble_mood <mood>              — phone UI context (for OLED sync only)
+  ble_activity <type> <json>   — user did an activity; json may include score
+  ble_game <type> <json>       — game outcome; json may include score
+  ble_prefs <json>             — onboarding prefs saved
+  ble_cmd <json>               — generic: {cmd:"media",state:"music"|"video"|"none"}
+                                          {cmd:"revive"}
 
-Usage on Pi:
-    sudo python3 main.py --driver luma
+Legacy direct events (kept for backward compat):
+  feed / pet / play / sleep / speak / poke
 
-Quick desktop test:
+Usage:
+    sudo python3 main.py --driver luma          # real hardware
     python3 main.py --driver preview --once happy
 """
 
@@ -36,6 +42,8 @@ from pixel_pal import (
     draw_music_frame, draw_video_frame, draw_pin_frame,
     EXPRESSIONS, W, H,
 )
+from engine import EvaState, apply_activity, apply_decay, get_activity_expr, ambient_mood
+from engine.expressions import MOOD_EXPR_MAP
 
 
 # ============================================================
@@ -86,81 +94,6 @@ def make_driver(name: str):
 
 
 # ============================================================
-# Tamagotchi stats
-# ============================================================
-
-def clamp(v, lo=0.0, hi=100.0):
-    return max(lo, min(hi, v))
-
-
-def ambient(stats):
-    if stats["energy"] < 15:   return "sleepy"
-    if stats["energy"] < 30:   return "yawn"
-    if stats["fullness"] < 20: return "hungry"
-    if stats["love"] < 20:     return "sad"
-    if stats["love"] > 85:     return "happy"
-    if stats["energy"] > 85 and stats["fullness"] > 60: return "idle"
-    return "neutral"
-
-
-# Legacy simple events
-LEGACY_EVENTS = {
-    "feed":  ("happy",     2.5, {"fullness": +30}),
-    "pet":   ("love",      2.8, {"love": +25}),
-    "play":  ("excited",   2.8, {"love": +12, "energy": -8}),
-    "sleep": ("sleeping",  5.0, {"energy": +35}),
-    "speak": ("singing",   2.8, {}),
-    "poke":  (None,        1.8, {}),
-}
-
-# Map phone mood strings → expressions
-MOOD_TO_EXPR = {
-    "happy":   "happy",
-    "sad":     "sad",
-    "sleepy":  "sleepy",
-    "excited": "excited",
-    "hungry":  "hungry",
-    "angry":   "angry",
-    "neutral": "neutral",
-    "idle":    "idle",
-}
-
-# Map activity types → (expression, hold_s)
-ACTIVITY_TO_EXPR = {
-    "eat":          ("happy",   2.0),
-    "feed_start":   ("hungry",  1.5),
-    "feed_done":    ("happy",   2.5),
-    "feed_cancel":  ("neutral", 1.0),
-    "wash_start":   ("shocked", 1.5),
-    "wash_done":    ("giggle",  2.5),
-    "wash_cancel":  ("neutral", 1.0),
-    "rest_start":   ("sleepy",  2.5),
-    "rest_done":    ("happy",   2.5),
-    "rest_cancel":  ("yawn",    1.5),
-    "play_start":   ("excited", 1.8),
-    "play_done":    ("excited", 2.5),
-    "play_cancel":  ("sad",     1.5),
-    "cook_success": ("excited", 2.5),
-    "cook_burned":  ("sad",     2.0),
-    "cook_start":   ("singing", 2.0),
-    "cinema_start": ("excited", 2.0),
-    "cinema_done":  ("sleepy",  2.5),
-    "gym_start":    ("surprised", 1.5),
-    "gym_done":     ("happy",   2.5),
-    "market_buy":   ("giggle",  1.5),
-    "stars_done":   ("excited", 2.5),
-    "reaction_done":("excited", 2.0),
-    "memory_done":  ("love",    2.0),
-    "balon_done":   ("excited", 2.5),
-    "hizlimat_done":("happy",   2.0),
-}
-
-
-def random_poke():
-    return random.choice(["surprised", "shocked", "dizzy", "mad", "silly", "wink"])
-
-
-# ============================================================
 # Event file drain
 # ============================================================
 
@@ -177,31 +110,46 @@ def drain_events():
             f.truncate(0)
     except Exception:
         return []
-    return [line.strip() for line in content.splitlines() if line.strip()]
+    return [ln.strip() for ln in content.splitlines() if ln.strip()]
 
 
 # ============================================================
-# Wave animation — play N cycles then transition to sleeping
+# Wave animation (blocking, ~4 s)
 # ============================================================
 
-WAVE_CYCLES   = 3       # 3 × 12 frames = 36 frames of waving
-WAVE_FPS      = 12      # faster for the animation
-SLEEP_DELAY_S = 3.0     # after wave, delay before switching to sleeping
+WAVE_CYCLES   = 3
+WAVE_FPS      = 12
+SLEEP_DELAY_S = 3.0
 
 
 def play_wave_goodbye(driver, sleep_fn=None):
-    """Block for WAVE_CYCLES × 12 frames then optionally call sleep_fn."""
-    frame_dur = 1.0 / WAVE_FPS
+    frame_dur   = 1.0 / WAVE_FPS
     total_frames = WAVE_CYCLES * 12
     for i in range(total_frames):
         img = blank_canvas()
         draw_wave_frame(img, i, expr_name="happy")
         driver.show(img)
         time.sleep(frame_dur)
-    # Pause, then sleep
     time.sleep(SLEEP_DELAY_S)
     if sleep_fn:
         sleep_fn()
+
+
+# ============================================================
+# Legacy direct events (pre-BLE era)
+# ============================================================
+
+LEGACY_EVENTS = {
+    "feed":  ("happy",    2.5, {"fullness": +30}),
+    "pet":   ("love",     2.8, {"love":     +25}),
+    "play":  ("excited",  2.8, {"love": +12, "energy": -8}),
+    "sleep": ("sleeping", 5.0, {"energy":   +35}),
+    "speak": ("singing",  2.8, {}),
+    "poke":  (None,       1.8, {}),
+}
+
+def random_poke():
+    return random.choice(["surprised", "shocked", "dizzy", "mad", "silly", "wink"])
 
 
 # ============================================================
@@ -213,13 +161,14 @@ def main():
     ap.add_argument("--driver", choices=["luma", "waveshare", "preview"], default="luma")
     ap.add_argument("--fps",   type=float, default=10.0)
     ap.add_argument("--decay", type=float, default=1.0,
-                    help="Stat decay multiplier. 1.0 = realistic.")
+                    help="Stat decay speed multiplier. 1.0 = realistic.")
     ap.add_argument("--once",  default=None,
-                    help="Render a single expression and exit.")
+                    help="Render a single expression once and exit.")
     args = ap.parse_args()
 
     driver = make_driver(args.driver)
 
+    # ── Single-expression preview mode ────────────────────────────────────────
     if args.once:
         if args.once not in EXPRESSIONS:
             print(f"unknown expression: {args.once}")
@@ -235,71 +184,79 @@ def main():
         driver.close()
         return
 
-    # ── Live loop state ────────────────────────────────────────────────
-    stats = {"fullness": 75.0, "love": 60.0, "energy": 90.0}
-    expr_name  = "neutral"
+    # ── Load persistent state ─────────────────────────────────────────────────
+    state = EvaState.load()
+    state.update_mood()
+    state.save_phone_view()
+
+    # ── Live loop variables ───────────────────────────────────────────────────
+    expr_name  = state.mood
     hold_until = 0.0
     next_blink = time.time() + random.uniform(3, 6)
     next_look  = time.time() + random.uniform(6, 10)
     look_until = 0.0
     look       = (0, 0)
     breathe_phase = 0
-    last_decay = time.time()
+    last_decay    = time.time()
+    last_save     = time.time()
 
     # BLE state
-    ble_connected  = False
-    wave_pending   = False
-    wave_done_at   = 0.0
-    phone_expr     = None   # last mood received from phone; None = no sync yet
+    ble_connected = False
+    phone_expr    = None    # last mood from phone; drives OLED when connected
 
-    # Media mode state
+    # Media mode
     media_mode  = 'none'   # 'none' | 'music' | 'video'
     media_frame = 0
 
-    # PIN pairing state
+    # PIN pairing
     pin_mode       = False
     display_pin    = ''
     pin_frame      = 0
     pin_fail_until = 0.0
 
     def cleanup(*_):
+        state.save()
         driver.close()
         sys.exit(0)
-    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGINT,  cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
     frame_period = 1.0 / args.fps
-
     print(f"EVA Pixel Pal running. BLE events via {EVENT_FILE}")
 
     while True:
         t0  = time.time()
         now = t0
 
-        # 1) Decay stats
-        if now - last_decay > 1.5 / args.decay:
-            stats["fullness"] = clamp(stats["fullness"] - 0.6)
-            stats["love"]     = clamp(stats["love"]     - 0.4)
-            stats["energy"]   = clamp(stats["energy"]   - 0.3)
+        # ── 1) Stat decay ─────────────────────────────────────────────────────
+        dt_decay = now - last_decay
+        if dt_decay >= frame_period:
+            apply_decay(state, dt_decay, speed=args.decay)
             last_decay = now
 
-        # 2) Drain + process events
+        # Periodic save + phone-view push (every 8 s)
+        if now - last_save >= 8.0:
+            state.update_mood()
+            state.save()
+            state.save_phone_view()
+            last_save = now
+
+        # ── 2) Drain + process events ─────────────────────────────────────────
         for ev in drain_events():
-            parts = ev.split(' ', 2)
+            parts   = ev.split(' ', 2)
             keyword = parts[0]
 
-            # ── BLE connect ───────────────────────────────────────────
+            # ── BLE connect ───────────────────────────────────────────────────
             if keyword == 'ble_connect':
                 ble_connected = True
-                wave_pending  = False
                 expr_name  = "excited"
                 hold_until = now + 2.5
 
-            # ── PIN pairing events ────────────────────────────────────
+            # ── PIN events ────────────────────────────────────────────────────
             elif keyword == 'ble_pin_show':
-                display_pin = parts[1] if len(parts) > 1 else '------'
-                pin_mode    = True
-                pin_frame   = 0
+                display_pin    = parts[1] if len(parts) > 1 else '------'
+                pin_mode       = True
+                pin_frame      = 0
                 pin_fail_until = 0.0
 
             elif keyword == 'ble_pin_ok':
@@ -315,102 +272,96 @@ def main():
             elif keyword == 'ble_pin_fail':
                 pin_fail_until = now + 1.5
 
-            # ── BLE disconnect ────────────────────────────────────────
+            # ── BLE disconnect ────────────────────────────────────────────────
             elif keyword == 'ble_disconnect':
                 ble_connected  = False
                 pin_mode       = False
                 display_pin    = ''
                 pin_fail_until = 0.0
-                media_mode  = 'none'
-                media_frame = 0
-                phone_expr  = None
-                # Play wave animation inline (blocks the loop ~4 s).
+                media_mode     = 'none'
+                media_frame    = 0
+                phone_expr     = None
+
                 def go_sleep():
                     nonlocal expr_name, hold_until
                     expr_name  = "sleeping"
-                    hold_until = now + 999  # stay asleep until reconnect
+                    hold_until = now + 999
 
                 play_wave_goodbye(driver, sleep_fn=go_sleep)
-                # After returning, loop continues with sleeping state.
 
-            # ── Proximity ─────────────────────────────────────────────
+            # ── Proximity ─────────────────────────────────────────────────────
             elif keyword == 'ble_proximity':
                 level = parts[1] if len(parts) > 1 else 'medium'
-                if level == 'close' and ble_connected:
-                    # Already connected and close — stay happy
-                    if now >= hold_until:
-                        expr_name = "happy"
-                elif level == 'far' and ble_connected:
-                    # Phone moved away but still technically connected
-                    if now >= hold_until:
-                        expr_name = "sleepy"
+                if ble_connected and now >= hold_until:
+                    if level == 'close':  expr_name = phone_expr or 'happy'
+                    elif level == 'far':  expr_name = 'sleepy'
 
-            # ── Mood from phone ───────────────────────────────────────
+            # ── Mood from phone (OLED sync only — Pi ignores stat payload) ────
             elif keyword == 'ble_mood':
                 mood_str = parts[1] if len(parts) > 1 else 'neutral'
-                phone_expr = MOOD_TO_EXPR.get(mood_str, 'neutral')
-                # Update love/fullness/energy from stats JSON if provided
-                if len(parts) > 2:
-                    try:
-                        phone_stats = json.loads(parts[2])
-                        if 'hunger' in phone_stats:
-                            stats['fullness'] = clamp(phone_stats['hunger'])
-                        if 'happiness' in phone_stats:
-                            stats['love'] = clamp(phone_stats['happiness'])
-                        if 'energy' in phone_stats:
-                            stats['energy'] = clamp(phone_stats['energy'])
-                    except Exception:
-                        pass
-                # Apply phone mood immediately; hold briefly for activity
-                # reactions not to be overwritten, then drift back to phone_expr.
+                phone_expr = MOOD_EXPR_MAP.get(mood_str, 'neutral')
                 expr_name  = phone_expr
                 hold_until = now + 0.5
 
-            # ── Activity reaction ─────────────────────────────────────
-            elif keyword == 'ble_activity':
+            # ── Activity (Pi applies effects + picks OLED expression) ─────────
+            elif keyword in ('ble_activity', 'ble_game'):
                 atype = parts[1] if len(parts) > 1 else ''
-                if atype in ACTIVITY_TO_EXPR:
-                    target_expr, hold_s = ACTIVITY_TO_EXPR[atype]
-                    expr_name  = target_expr
-                    hold_until = now + hold_s
+                score = 1.0
+                if len(parts) > 2:
+                    try:
+                        score = float(json.loads(parts[2]).get('score', 1.0))
+                    except Exception:
+                        pass
+                if atype:
+                    deltas = apply_activity(state, atype, score, now=now)
+                    state.update_mood()
+                    state.save()
+                    state.save_phone_view()
+                    print(f"  activity={atype} score={score:.2f} deltas={deltas}")
+                    expr_info = get_activity_expr(atype)
+                    if expr_info:
+                        expr_name, hold_s = expr_info
+                        hold_until = now + hold_s
 
-            # ── Game reaction ─────────────────────────────────────────
-            elif keyword == 'ble_game':
-                gtype = parts[1] if len(parts) > 1 else ''
-                if gtype in ACTIVITY_TO_EXPR:
-                    target_expr, hold_s = ACTIVITY_TO_EXPR[gtype]
-                    expr_name  = target_expr
-                    hold_until = now + hold_s
-
-            # ── Prefs (no visual reaction needed) ─────────────────────
+            # ── Prefs (no visual reaction) ────────────────────────────────────
             elif keyword == 'ble_prefs':
-                pass  # stored by ble_server.py already
+                pass
 
-            # ── Generic BLE command (includes media mode) ──────────────
+            # ── Generic BLE command ───────────────────────────────────────────
             elif keyword == 'ble_cmd':
                 try:
                     payload = json.loads(parts[1]) if len(parts) > 1 else {}
                 except Exception:
                     payload = {}
-                if payload.get('cmd') == 'media':
+
+                cmd = payload.get('cmd', '')
+
+                if cmd == 'media':
                     new_mode = payload.get('state', 'none')
                     if new_mode != media_mode:
                         media_mode  = new_mode
                         media_frame = 0
                         if media_mode == 'music':
-                            expr_name  = 'singing'
-                            hold_until = now + 1.5
+                            expr_name = 'singing'; hold_until = now + 1.5
                         elif media_mode == 'video':
-                            expr_name  = 'excited'
-                            hold_until = now + 1.5
+                            expr_name = 'excited'; hold_until = now + 1.5
                         else:
-                            hold_until = 0.0  # drift to ambient immediately
+                            hold_until = 0.0
 
-            # ── Legacy events ─────────────────────────────────────────
+                elif cmd == 'revive':
+                    state.revive()
+                    expr_name  = 'happy'
+                    hold_until = now + 3.0
+                    pin_mode   = False
+                    print("  EVA revived!")
+
+            # ── Legacy events ─────────────────────────────────────────────────
             elif keyword in LEGACY_EVENTS:
                 target, hold, delta = LEGACY_EVENTS[keyword]
                 for k, v in delta.items():
-                    stats[k] = clamp(stats[k] + v)
+                    if hasattr(state.stats, k):
+                        setattr(state.stats, k,
+                                max(0.0, min(100.0, getattr(state.stats, k) + v)))
                 if keyword == "poke":
                     target = random_poke()
                 expr_name  = target or expr_name
@@ -419,29 +370,27 @@ def main():
             else:
                 print(f"  unknown event: {ev}")
 
-        # 3) Drift: when connected, always follow phone's last known mood.
-        #    Fall back to local ambient() only if we have no phone sync yet.
+        # ── 3) Drift toward ambient when hold expires ─────────────────────────
         if now >= hold_until:
             if not ble_connected:
                 want = "sleeping"
             elif phone_expr is not None:
-                want = phone_expr   # stay locked to what phone says
+                want = phone_expr
             else:
-                want = ambient(stats)
+                want = ambient_mood(state.stats)
             if want != expr_name:
                 expr_name = want
 
-        # 4) Blink
+        # ── 4) Blink ──────────────────────────────────────────────────────────
         blink = 0.0
         if expr_name not in ("sleeping", "closed") and now > next_blink:
             t_into = now - next_blink
-            if t_into < 0.04:    blink = 0.5
-            elif t_into < 0.08:  blink = 1.0
-            elif t_into < 0.12:  blink = 0.5
-            else:
-                next_blink = now + random.uniform(3, 6)
+            if t_into < 0.04:   blink = 0.5
+            elif t_into < 0.08: blink = 1.0
+            elif t_into < 0.12: blink = 0.5
+            else: next_blink = now + random.uniform(3, 6)
 
-        # 5) Look
+        # ── 5) Look ───────────────────────────────────────────────────────────
         if now > next_look and look_until == 0.0:
             look = (random.choice([-2, -1, 0, 1, 2]),
                     random.choice([-1, 0, 0, 0, 1]))
@@ -451,15 +400,15 @@ def main():
             look_until = 0.0
             next_look  = now + random.uniform(6, 10)
 
-        # 6) Breathe
+        # ── 6) Breathe ────────────────────────────────────────────────────────
         breathe_phase = int(now * 1.4) % 4
-        cy_offset = -1 if breathe_phase == 1 else (1 if breathe_phase == 3 else 0)
+        cy_offset     = -1 if breathe_phase == 1 else (1 if breathe_phase == 3 else 0)
 
-        # 7) Render
+        # ── 7) Render ─────────────────────────────────────────────────────────
         img = blank_canvas()
         if pin_mode:
             if now < pin_fail_until:
-                draw_face(img, "mad")   # brief angry flash on wrong PIN
+                draw_face(img, "mad")
             else:
                 draw_pin_frame(img, display_pin, pin_frame)
                 pin_frame += 1
@@ -476,7 +425,7 @@ def main():
                       global_look=look)
         driver.show(img)
 
-        # 8) Pace
+        # ── 8) Pace ───────────────────────────────────────────────────────────
         dt = time.time() - t0
         if dt < frame_period:
             time.sleep(frame_period - dt)

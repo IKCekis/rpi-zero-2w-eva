@@ -1,20 +1,17 @@
 """
 ble_server.py — EVA BLE GATT Peripheral for Raspberry Pi Zero 2W.
 
-Exposes three characteristics to the phone:
-  MOOD_CHAR  (write)  — phone pushes mood + stats JSON
-  PREFS_CHAR (r/w)    — phone writes onboarding prefs; also readable for restore
-  CMD_CHAR   (write)  — phone sends activity/game/proximity commands
+Characteristics:
+  MOOD_CHAR  (write)         — phone pushes mood indicator for OLED sync
+  PREFS_CHAR (r/w)           — onboarding prefs; includes _pin_ok flag
+  CMD_CHAR   (write)         — activity/game/proximity/media commands
+  STATE_CHAR (read + notify) — Pi pushes stat/meta snapshot to phone every 500 ms
 
-All incoming data is base64-encoded JSON.  On each write this server appends
-a structured event line to /run/pal.events so main.py can react.
+All incoming data is base64-encoded JSON.  Writes append structured event lines
+to /run/pal.events; main.py reads and processes them.
 
 Run as root (required for bluezero GATT peripheral):
     sudo python3 ble_server.py
-
-Requires:
-    pip3 install bluezero
-    sudo systemctl enable --now bluetooth
 """
 
 from __future__ import annotations
@@ -27,18 +24,21 @@ import threading
 from pathlib import Path
 
 from bluezero import peripheral, adapter
+from gi.repository import GLib
 
 log = logging.getLogger("ble_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ── UUIDs (must match BLE constants in the mobile app) ───────────────────────
-EVA_SERVICE_UUID = 'a1f7b540-0f8e-4a64-a027-f21f65ff8c1d'
-MOOD_CHAR_UUID   = 'a1f7b541-0f8e-4a64-a027-f21f65ff8c1d'
-PREFS_CHAR_UUID  = 'a1f7b542-0f8e-4a64-a027-f21f65ff8c1d'
-CMD_CHAR_UUID    = 'a1f7b543-0f8e-4a64-a027-f21f65ff8c1d'
+EVA_SERVICE_UUID  = 'a1f7b540-0f8e-4a64-a027-f21f65ff8c1d'
+MOOD_CHAR_UUID    = 'a1f7b541-0f8e-4a64-a027-f21f65ff8c1d'
+PREFS_CHAR_UUID   = 'a1f7b542-0f8e-4a64-a027-f21f65ff8c1d'
+CMD_CHAR_UUID     = 'a1f7b543-0f8e-4a64-a027-f21f65ff8c1d'
+STATE_CHAR_UUID   = 'a1f7b544-0f8e-4a64-a027-f21f65ff8c1d'
 
-EVENT_FILE = Path('/run/pal.events')
-PREFS_FILE = Path('/run/pal.prefs.json')
+EVENT_FILE  = Path('/run/pal.events')
+PREFS_FILE  = Path('/run/pal.prefs.json')
+PHONE_FILE  = Path('/run/pal.phone.json')   # compact state written by main.py
 
 # ── Internal state ────────────────────────────────────────────────────────────
 _prefs_bytes: list[int] = []
@@ -169,11 +169,48 @@ def write_cmd(value: list[int], options: dict) -> None:
         _emit(f'ble_cmd {json.dumps(data)}')
 
 
+# ── STATE_CHAR callbacks + GLib push timer ────────────────────────────────────
+
+_state_char_ref  = None   # localGATT.Characteristic for STATE_CHAR, set in main()
+_last_phone_hash = 0
+
+
+def read_state() -> list[int]:
+    try:
+        content = PHONE_FILE.read_bytes()
+        return list(base64.b64encode(content))
+    except Exception:
+        return list(base64.b64encode(b'{}'))
+
+
+def on_state_notify(notifying: bool, characteristic=None) -> None:
+    log.info("state notify subscription: %s", notifying)
+
+
+def _notify_state_tick() -> bool:
+    """GLib timer — polls /run/pal.phone.json every 500 ms and notifies if changed."""
+    global _last_phone_hash
+    if _state_char_ref is None or not PHONE_FILE.exists():
+        return True
+    try:
+        content = PHONE_FILE.read_bytes()
+        h = hash(content)
+        if h != _last_phone_hash:
+            _last_phone_hash = h
+            _state_char_ref.set_value(list(base64.b64encode(content)))
+    except Exception as e:
+        log.warning("state notify error: %s", e)
+    return True  # keep timer running
+
+
 # ── Connection callbacks ──────────────────────────────────────────────────────
 
 def on_connect(device_path: str) -> None:
     global _pending_pin, _pin_verified
-    _pending_pin = f"{random.randint(0, 999999):06d}"
+    # Keep existing PIN if we're mid-pairing (reconnect during PIN entry).
+    # Only generate a fresh PIN at the start of a new pairing session.
+    if _pin_verified or not _pending_pin:
+        _pending_pin = f"{random.randint(0, 999999):06d}"
     _pin_verified = False
     log.info("phone connected: %s  PIN: %s", device_path, _pending_pin)
     _emit('ble_connect')
@@ -236,11 +273,27 @@ def main() -> None:
         notify_callback=None,
     )
 
+    pal.add_characteristic(
+        srv_id=1, chr_id=4,
+        uuid=STATE_CHAR_UUID,
+        value=list(base64.b64encode(b'{}')),
+        notifying=False,
+        flags=['read', 'notify'],
+        read_callback=read_state,
+        write_callback=None,
+        notify_callback=on_state_notify,
+    )
+
     pal.on_connect    = on_connect
     pal.on_disconnect = on_disconnect
 
     if not EVENT_FILE.exists():
         EVENT_FILE.touch(mode=0o666)
+
+    # Store reference to STATE_CHAR (last characteristic added) for GLib timer.
+    global _state_char_ref
+    _state_char_ref = pal.characteristics[-1]
+    GLib.timeout_add(500, _notify_state_tick)
 
     log.info("EVA-001 BLE peripheral publishing…  (Ctrl-C to stop)")
     pal.publish()
