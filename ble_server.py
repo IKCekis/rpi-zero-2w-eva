@@ -137,6 +137,11 @@ def write_mood(value: list[int], options: dict) -> None:
 
 def write_cmd(value: list[int], options: dict) -> None:
     global _pin_verified
+    try:
+        Path('/tmp/ble_cmd_called').write_text(f"len={len(value)} val={value[:8]}")
+    except Exception:
+        pass
+    log.info("write_cmd RAW len=%d", len(value))
     data = _decode(value)
     if data is None:
         return
@@ -194,10 +199,14 @@ def _notify_state_tick() -> bool:
         return True
     try:
         content = PHONE_FILE.read_bytes()
-        h = hash(content)
+        # Merge pending_pin so phone can verify locally (writes may be unreliable)
+        data = json.loads(content)
+        data['pending_pin'] = _pending_pin
+        merged = json.dumps(data, separators=(',', ':')).encode()
+        h = hash(merged)
         if h != _last_phone_hash:
             _last_phone_hash = h
-            _state_char_ref.set_value(list(base64.b64encode(content)))
+            _state_char_ref.set_value(list(base64.b64encode(merged)))
     except Exception as e:
         log.warning("state notify error: %s", e)
     return True  # keep timer running

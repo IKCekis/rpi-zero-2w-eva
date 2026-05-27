@@ -213,6 +213,7 @@ def main():
     display_pin    = ''
     pin_frame      = 0
     pin_fail_until = 0.0
+    pin_show_at    = 0.0
 
     def cleanup(*_):
         state.save()
@@ -258,6 +259,7 @@ def main():
                 pin_mode       = True
                 pin_frame      = 0
                 pin_fail_until = 0.0
+                pin_show_at    = now  # for 60 s auto-exit if write never arrives
 
             elif keyword == 'ble_pin_ok':
                 pin_mode    = False
@@ -407,7 +409,9 @@ def main():
         # ── 7) Render ─────────────────────────────────────────────────────────
         img = blank_canvas()
         if pin_mode:
-            if now < pin_fail_until:
+            if pin_show_at and (now - pin_show_at) > 60.0:
+                pin_mode = False  # give up waiting for write-based verify
+            elif now < pin_fail_until:
                 draw_face(img, "mad")
             else:
                 draw_pin_frame(img, display_pin, pin_frame)
