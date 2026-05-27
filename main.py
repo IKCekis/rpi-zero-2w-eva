@@ -250,6 +250,7 @@ def main():
     ble_connected  = False
     wave_pending   = False
     wave_done_at   = 0.0
+    phone_expr     = None   # last mood received from phone; None = no sync yet
 
     # Media mode state
     media_mode  = 'none'   # 'none' | 'music' | 'video'
@@ -293,6 +294,7 @@ def main():
                 ble_connected = False
                 media_mode  = 'none'
                 media_frame = 0
+                phone_expr  = None
                 # Play wave animation inline (blocks the loop ~4 s).
                 def go_sleep():
                     nonlocal expr_name, hold_until
@@ -330,8 +332,10 @@ def main():
                             stats['energy'] = clamp(phone_stats['energy'])
                     except Exception:
                         pass
+                # Apply phone mood immediately; hold briefly for activity
+                # reactions not to be overwritten, then drift back to phone_expr.
                 expr_name  = phone_expr
-                hold_until = now + 1.5
+                hold_until = now + 0.5
 
             # ── Activity reaction ─────────────────────────────────────
             elif keyword == 'ble_activity':
@@ -386,9 +390,15 @@ def main():
             else:
                 print(f"  unknown event: {ev}")
 
-        # 3) Drift to ambient if not held and connected
+        # 3) Drift: when connected, always follow phone's last known mood.
+        #    Fall back to local ambient() only if we have no phone sync yet.
         if now >= hold_until:
-            want = "sleeping" if not ble_connected else ambient(stats)
+            if not ble_connected:
+                want = "sleeping"
+            elif phone_expr is not None:
+                want = phone_expr   # stay locked to what phone says
+            else:
+                want = ambient(stats)
             if want != expr_name:
                 expr_name = want
 
