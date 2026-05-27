@@ -33,7 +33,7 @@ from pathlib import Path
 
 from pixel_pal import (
     blank_canvas, draw_face, draw_wave_frame,
-    draw_music_frame, draw_video_frame,
+    draw_music_frame, draw_video_frame, draw_pin_frame,
     EXPRESSIONS, W, H,
 )
 
@@ -256,6 +256,12 @@ def main():
     media_mode  = 'none'   # 'none' | 'music' | 'video'
     media_frame = 0
 
+    # PIN pairing state
+    pin_mode       = False
+    display_pin    = ''
+    pin_frame      = 0
+    pin_fail_until = 0.0
+
     def cleanup(*_):
         driver.close()
         sys.exit(0)
@@ -289,9 +295,32 @@ def main():
                 expr_name  = "excited"
                 hold_until = now + 2.5
 
+            # ── PIN pairing events ────────────────────────────────────
+            elif keyword == 'ble_pin_show':
+                display_pin = parts[1] if len(parts) > 1 else '------'
+                pin_mode    = True
+                pin_frame   = 0
+                pin_fail_until = 0.0
+
+            elif keyword == 'ble_pin_ok':
+                pin_mode    = False
+                display_pin = ''
+                expr_name   = "happy"
+                hold_until  = now + 2.0
+
+            elif keyword == 'ble_pin_skip':
+                pin_mode    = False
+                display_pin = ''
+
+            elif keyword == 'ble_pin_fail':
+                pin_fail_until = now + 1.5
+
             # ── BLE disconnect ────────────────────────────────────────
             elif keyword == 'ble_disconnect':
-                ble_connected = False
+                ble_connected  = False
+                pin_mode       = False
+                display_pin    = ''
+                pin_fail_until = 0.0
                 media_mode  = 'none'
                 media_frame = 0
                 phone_expr  = None
@@ -428,7 +457,13 @@ def main():
 
         # 7) Render
         img = blank_canvas()
-        if media_mode == 'music':
+        if pin_mode:
+            if now < pin_fail_until:
+                draw_face(img, "mad")   # brief angry flash on wrong PIN
+            else:
+                draw_pin_frame(img, display_pin, pin_frame)
+                pin_frame += 1
+        elif media_mode == 'music':
             draw_music_frame(img, media_frame)
             media_frame += 1
         elif media_mode == 'video':

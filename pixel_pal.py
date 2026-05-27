@@ -417,6 +417,34 @@ def draw_video_frame(image: Image.Image, frame: int) -> None:
 
 
 # ============================================================
+# PIN display — show pairing code on OLED
+# ============================================================
+
+def draw_pin_frame(image: Image.Image, pin: str, frame: int) -> None:
+    """Pairing PIN: blinking border + label + spaced digits."""
+    from PIL import ImageFont
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.load_default(size=10)
+    except TypeError:
+        font = ImageFont.load_default()
+
+    # Border blinks 15 on / 15 off
+    if (frame // 15) % 2 == 0:
+        draw.rectangle((0, 0, W - 1, H - 1), outline=ON)
+
+    draw.text((4, 2), "ESLESTIR:", fill=ON, font=font)
+
+    spaced = " ".join(pin)
+    try:
+        bbox = draw.textbbox((0, 0), spaced, font=font)
+        tw = bbox[2] - bbox[0]
+    except AttributeError:
+        tw = len(spaced) * 6
+    draw.text((max(2, (W - tw) // 2), 18), spaced, fill=ON, font=font)
+
+
+# ============================================================
 # Expression presets
 # ============================================================
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import base64
 import logging
+import random
 import subprocess
 import threading
 from pathlib import Path
@@ -41,7 +42,9 @@ PREFS_FILE = Path('/run/pal.prefs.json')
 
 # ── Internal state ────────────────────────────────────────────────────────────
 _prefs_bytes: list[int] = []
-_lock = threading.Lock()
+_lock        = threading.Lock()
+_pending_pin: str  = ''     # 6-digit PIN shown on OLED for current connection
+_pin_verified: bool = False  # set True after correct verify_pin command
 
 
 def _clear_bonds() -> None:
@@ -92,12 +95,20 @@ def _decode(value: list[int]) -> dict | None:
 def read_prefs() -> list[int]:
     with _lock:
         if _prefs_bytes:
-            return _prefs_bytes
+            # Include PIN status so phone can check verification result
+            try:
+                data = json.loads(bytes(_prefs_bytes).decode())
+            except Exception:
+                data = {}
+            data['_pin_ok'] = _pin_verified
+            return list(base64.b64encode(json.dumps(data).encode()))
     try:
-        data = PREFS_FILE.read_bytes()
-        return list(data)
+        raw  = json.loads(PREFS_FILE.read_text())
+        raw['_pin_ok'] = _pin_verified
+        return list(base64.b64encode(json.dumps(raw).encode()))
     except Exception:
-        return list(base64.b64encode(b'{}'))
+        payload = json.dumps({'_pin_ok': _pin_verified}).encode()
+        return list(base64.b64encode(payload))
 
 
 def write_prefs(value: list[int], options: dict) -> None:
@@ -125,6 +136,7 @@ def write_mood(value: list[int], options: dict) -> None:
 
 
 def write_cmd(value: list[int], options: dict) -> None:
+    global _pin_verified
     data = _decode(value)
     if data is None:
         return
@@ -140,6 +152,19 @@ def write_cmd(value: list[int], options: dict) -> None:
     elif cmd == 'game':
         gtype = data.get('type', '')
         _emit(f'ble_game {gtype} {json.dumps(data)}')
+    elif cmd == 'verify_pin':
+        entered = str(data.get('pin', ''))
+        if entered == _pending_pin:
+            _pin_verified = True
+            log.info("PIN verified OK")
+            _emit('ble_pin_ok')
+        else:
+            log.info("PIN mismatch: got %s expected %s", entered, _pending_pin)
+            _emit('ble_pin_fail')
+    elif cmd == 'skip_pin':
+        _pin_verified = True
+        log.info("PIN skipped (returning device)")
+        _emit('ble_pin_skip')
     else:
         _emit(f'ble_cmd {json.dumps(data)}')
 
@@ -147,8 +172,12 @@ def write_cmd(value: list[int], options: dict) -> None:
 # ── Connection callbacks ──────────────────────────────────────────────────────
 
 def on_connect(device_path: str) -> None:
-    log.info("phone connected: %s", device_path)
+    global _pending_pin, _pin_verified
+    _pending_pin = f"{random.randint(0, 999999):06d}"
+    _pin_verified = False
+    log.info("phone connected: %s  PIN: %s", device_path, _pending_pin)
     _emit('ble_connect')
+    _emit(f'ble_pin_show {_pending_pin}')
 
 
 def on_disconnect(device_path: str) -> None:
