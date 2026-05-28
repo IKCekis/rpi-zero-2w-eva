@@ -277,19 +277,26 @@ def main():
             # ── BLE disconnect ────────────────────────────────────────────────
             elif keyword == 'ble_disconnect':
                 ble_connected  = False
-                pin_mode       = False
-                display_pin    = ''
-                pin_fail_until = 0.0
                 media_mode     = 'none'
                 media_frame    = 0
                 phone_expr     = None
 
-                def go_sleep():
-                    nonlocal expr_name, hold_until
-                    expr_name  = "sleeping"
-                    hold_until = now + 999
+                if pin_mode:
+                    # Pairing not finished. Android frequently drops the link
+                    # mid-PIN-entry and reconnects within seconds, so keep showing
+                    # the SAME PIN instead of waving goodbye and sleeping. The 60s
+                    # pin_show_at auto-exit still bounds how long we wait.
+                    pass
+                else:
+                    display_pin    = ''
+                    pin_fail_until = 0.0
 
-                play_wave_goodbye(driver, sleep_fn=go_sleep)
+                    def go_sleep():
+                        nonlocal expr_name, hold_until
+                        expr_name  = "sleeping"
+                        hold_until = now + 999
+
+                    play_wave_goodbye(driver, sleep_fn=go_sleep)
 
             # ── Proximity ─────────────────────────────────────────────────────
             elif keyword == 'ble_proximity':

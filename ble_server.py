@@ -187,9 +187,18 @@ _last_phone_hash = 0
 
 
 def read_state() -> list[int]:
+    # Merge pending_pin + _pin_ok so a DIRECT read carries them too — not only the
+    # notify path. The phone relies on this to verify the PIN even when notifications
+    # or the verify_pin write are dropped on a flaky link.
     try:
-        content = PHONE_FILE.read_bytes()
-        return list(base64.b64encode(content))
+        data = json.loads(PHONE_FILE.read_bytes())
+    except Exception:
+        data = {}
+    data['pending_pin'] = _pending_pin
+    data['_pin_ok'] = _pin_verified
+    try:
+        merged = json.dumps(data, separators=(',', ':')).encode()
+        return list(base64.b64encode(merged))
     except Exception:
         return list(base64.b64encode(b'{}'))
 
@@ -205,9 +214,10 @@ def _notify_state_tick() -> bool:
         return True
     try:
         content = PHONE_FILE.read_bytes()
-        # Merge pending_pin so phone can verify locally (writes may be unreliable)
+        # Merge pending_pin + _pin_ok so phone can verify locally (writes may be unreliable)
         data = json.loads(content)
         data['pending_pin'] = _pending_pin
+        data['_pin_ok'] = _pin_verified
         merged = json.dumps(data, separators=(',', ':')).encode()
         h = hash(merged)
         if h != _last_phone_hash:
