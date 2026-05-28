@@ -7,8 +7,9 @@ Characteristics:
   CMD_CHAR   (write)         — activity/game/proximity/media commands
   STATE_CHAR (read + notify) — Pi pushes stat/meta snapshot to phone every 500 ms
 
-All incoming data is base64-encoded JSON.  Writes append structured event lines
-to /run/pal.events; main.py reads and processes them.
+All payloads are raw UTF-8 JSON on the wire (ble-plx applies the only base64
+layer on the phone side).  Writes append structured event lines to
+/run/pal.events; main.py reads and processes them.
 
 Run as root (required for bluezero GATT peripheral):
     sudo python3 ble_server.py
@@ -16,7 +17,6 @@ Run as root (required for bluezero GATT peripheral):
 
 from __future__ import annotations
 import json
-import base64
 import logging
 import random
 import subprocess
@@ -87,10 +87,13 @@ def _emit(line: str) -> None:
 
 
 def _decode(value: list[int]) -> dict | None:
-    """Decode a list of bytes that is base64-encoded JSON."""
+    """Decode a list of raw bytes that is UTF-8 JSON.
+
+    ble-plx base64-decodes the phone's payload at its API boundary, so the bytes
+    that arrive here are already plain JSON — do NOT base64-decode again.
+    """
     try:
-        raw = bytes(value)
-        return json.loads(base64.b64decode(raw).decode())
+        return json.loads(bytes(value).decode())
     except Exception as e:
         log.warning("decode error: %s", e)
         return None
@@ -99,6 +102,8 @@ def _decode(value: list[int]) -> dict | None:
 # ── Characteristic callbacks ─────────────────────────────────────────────────
 
 def read_prefs() -> list[int]:
+    # Return RAW JSON bytes. ble-plx base64-encodes them for the phone, which
+    # base64-decodes once — adding base64 here would double-encode and break parsing.
     with _lock:
         if _prefs_bytes:
             # Include PIN status so phone can check verification result
@@ -107,14 +112,13 @@ def read_prefs() -> list[int]:
             except Exception:
                 data = {}
             data['_pin_ok'] = _pin_verified
-            return list(base64.b64encode(json.dumps(data).encode()))
+            return list(json.dumps(data).encode())
     try:
         raw  = json.loads(PREFS_FILE.read_text())
         raw['_pin_ok'] = _pin_verified
-        return list(base64.b64encode(json.dumps(raw).encode()))
+        return list(json.dumps(raw).encode())
     except Exception:
-        payload = json.dumps({'_pin_ok': _pin_verified}).encode()
-        return list(base64.b64encode(payload))
+        return list(json.dumps({'_pin_ok': _pin_verified}).encode())
 
 
 def write_prefs(value: list[int], options: dict) -> None:
@@ -198,13 +202,21 @@ def read_state() -> list[int]:
     data['_pin_ok'] = _pin_verified
     try:
         merged = json.dumps(data, separators=(',', ':')).encode()
-        return list(base64.b64encode(merged))
+        return list(merged)  # raw JSON — ble-plx adds the only base64 layer
     except Exception:
-        return list(base64.b64encode(b'{}'))
+        return list(b'{}')
 
 
 def on_state_notify(notifying: bool, characteristic=None) -> None:
+    global _last_phone_hash
     log.info("state notify subscription: %s", notifying)
+    if notifying:
+        # CRITICAL: the PIN value is often set_value()'d before the phone finishes
+        # subscribing, so the change-detection tick never re-sends it and the phone
+        # never receives pending_pin via notify. Reset the hash to force an immediate
+        # re-push on the next tick. Local PIN verification depends on this because
+        # CMD_CHAR writes (verify_pin) do not reliably reach this peripheral.
+        _last_phone_hash = 0
 
 
 def _notify_state_tick() -> bool:
@@ -222,7 +234,7 @@ def _notify_state_tick() -> bool:
         h = hash(merged)
         if h != _last_phone_hash:
             _last_phone_hash = h
-            _state_char_ref.set_value(list(base64.b64encode(merged)))
+            _state_char_ref.set_value(list(merged))  # raw JSON; ble-plx base64s it
     except Exception as e:
         log.warning("state notify error: %s", e)
     return True  # keep timer running
@@ -284,7 +296,7 @@ def main() -> None:
     pal.add_characteristic(
         srv_id=1, chr_id=2,
         uuid=PREFS_CHAR_UUID,
-        value=list(base64.b64encode(b'{}')),
+        value=list(b'{}'),
         notifying=False,
         flags=['read', 'write'],
         read_callback=read_prefs,
@@ -306,7 +318,7 @@ def main() -> None:
     pal.add_characteristic(
         srv_id=1, chr_id=4,
         uuid=STATE_CHAR_UUID,
-        value=list(base64.b64encode(b'{}')),
+        value=list(b'{}'),
         notifying=False,
         flags=['read', 'notify'],
         read_callback=read_state,
