@@ -21,6 +21,7 @@ import logging
 import random
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from bluezero import peripheral, adapter
@@ -43,8 +44,13 @@ PHONE_FILE  = Path('/run/pal.phone.json')   # compact state written by main.py
 # ── Internal state ────────────────────────────────────────────────────────────
 _prefs_bytes: list[int] = []
 _lock        = threading.Lock()
-_pending_pin: str  = ''     # 6-digit PIN shown on OLED for current connection
+_pending_pin: str   = ''     # 6-digit PIN shown on OLED for current connection
 _pin_verified: bool = False  # set True after correct verify_pin command
+_pin_generated_at: float = 0.0
+
+# Keep the same PIN for this many seconds across rapid reconnects.
+# Prevents a new PIN being generated mid-entry when Android briefly drops the link.
+_PIN_TTL: float = 120.0
 
 
 def _clear_bonds() -> None:
@@ -215,13 +221,18 @@ def _notify_state_tick() -> bool:
 # ── Connection callbacks ──────────────────────────────────────────────────────
 
 def on_connect(device_path: str) -> None:
-    global _pending_pin, _pin_verified
-    # Keep existing PIN if we're mid-pairing (reconnect during PIN entry).
-    # Only generate a fresh PIN at the start of a new pairing session.
-    if _pin_verified or not _pending_pin:
+    global _pending_pin, _pin_verified, _pin_generated_at
+    now = time.monotonic()
+    within_ttl = bool(_pending_pin) and (now - _pin_generated_at) <= _PIN_TTL
+    if not within_ttl:
+        # Fresh session: generate new PIN and reset verification state.
+        # TTL window: keep the existing PIN (and _pin_verified flag) intact so that
+        # a rapid reconnect during PIN entry or right after verify_pin doesn't break the flow.
         _pending_pin = f"{random.randint(0, 999999):06d}"
-    _pin_verified = False
-    log.info("phone connected: %s  PIN: %s", device_path, _pending_pin)
+        _pin_generated_at = now
+        _pin_verified = False
+    log.info("phone connected: %s  PIN=%s  verified=%s  age=%.0fs",
+             device_path, _pending_pin, _pin_verified, now - _pin_generated_at)
     _emit('ble_connect')
     _emit(f'ble_pin_show {_pending_pin}')
 
