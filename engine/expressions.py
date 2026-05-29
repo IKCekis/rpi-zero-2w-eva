@@ -14,7 +14,9 @@ ACTIVITY_EXPRESSIONS: dict[str, Tuple[str, float]] = {
     'cook_start':    ('singing',   2.0),
     'cook_success':  ('excited',   2.5),
     'cook_burned':   ('sad',       2.0),
+    'cook_raw':      ('shocked',   1.8),
     'eat':           ('happy',     2.0),
+    'use_item':      ('happy',     2.0),
     # Hygiene
     'wash_start':    ('shocked',   1.5),
     'wash_done':     ('giggle',    2.5),
@@ -33,10 +35,19 @@ ACTIVITY_EXPRESSIONS: dict[str, Tuple[str, float]] = {
     'gym_done':      ('happy',     2.5),
     # Shopping
     'market_buy':    ('giggle',    1.5),
-    # Games
+    # Games — *_done events are cosmetic (reward comes via play_done); these
+    # just give the OLED a fitting reaction.
     'memory_done':   ('love',      2.0),
     'balon_done':    ('excited',   2.5),
     'hizlimat_done': ('happy',     2.0),
+    'colormatch_done':('excited',  2.0),
+    'colormatch_start':('curious', 1.2),
+    'pitch_done':    ('excited',   2.0),
+    'pitch_start':   ('curious',   1.2),
+    'rhythm_done':   ('singing',   2.0),
+    'rhythm_start':  ('excited',   1.2),
+    'simon_done':    ('giggle',    2.0),
+    'simon_start':   ('curious',   1.2),
     'play_start':    ('excited',   1.8),
     'play_done':     ('excited',   2.5),
     'play_cancel':   ('sad',       1.5),

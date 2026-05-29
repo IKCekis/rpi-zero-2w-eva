@@ -42,8 +42,27 @@ from pixel_pal import (
     draw_music_frame, draw_video_frame, draw_pin_frame,
     EXPRESSIONS, W, H,
 )
-from engine import EvaState, apply_activity, apply_decay, get_activity_expr, ambient_mood
+from engine import (
+    EvaState, apply_activity, apply_effect, apply_decay,
+    get_activity_expr, ambient_mood, ACTIVITY_BASE,
+)
 from engine.expressions import MOOD_EXPR_MAP
+
+
+# Phone OLED face vocabulary ({cmd:'face', anim}) → (expression, hold_seconds).
+# 'dance' / 'cinema_glasses' / 'popcorn' engage the looping media animations
+# instead and are handled separately. 'idle' releases back to ambient mood.
+FACE_ANIM_EXPR = {
+    'happy':   ('happy',    2.5),
+    'sad':     ('sad',      2.5),
+    'whistle': ('singing',  3.0),
+    'cook':    ('singing',  3.0),
+    'eat':     ('happy',    2.5),
+    'workout': ('excited',  3.0),
+    'sleep':   ('sleeping', 6.0),
+    'wash':    ('giggle',   3.0),
+    'play':    ('excited',  3.0),
+}
 
 
 # ============================================================
@@ -314,15 +333,32 @@ def main():
 
             # ── Activity (Pi applies effects + picks OLED expression) ─────────
             elif keyword in ('ble_activity', 'ble_game'):
-                atype = parts[1] if len(parts) > 1 else ''
-                score = 1.0
+                atype   = parts[1] if len(parts) > 1 else ''
+                payload = {}
                 if len(parts) > 2:
                     try:
-                        score = float(json.loads(parts[2]).get('score', 1.0))
+                        payload = json.loads(parts[2])
                     except Exception:
-                        pass
+                        payload = {}
+                score = float(payload.get('score', 1.0) or 1.0)
                 if atype:
-                    deltas = apply_activity(state, atype, score, now=now)
+                    if atype in ACTIVITY_BASE:
+                        # Pi-owned table (with diminishing-returns + variety logic).
+                        deltas = apply_activity(state, atype, score, now=now)
+                    else:
+                        # No table (consumable item, cook_raw, custom): honour the
+                        # phone's requested stat effect. Cosmetic-only events like
+                        # game "<name>_done" carry no effect → harmless no-op.
+                        deltas = apply_effect(state, payload.get('effect', {}), now=now)
+                    # Money is phone-driven: apply the exact coin delta it computed
+                    # (negative = cost, positive = game/quest payout).
+                    try:
+                        coins = float(payload.get('coins', 0) or 0)
+                    except Exception:
+                        coins = 0.0
+                    if coins:
+                        state.meta.money = max(0.0, state.meta.money + coins)
+                        deltas['money'] = coins
                     state.update_mood()
                     state.save()
                     state.save_phone_view()
@@ -356,6 +392,33 @@ def main():
                             expr_name = 'excited'; hold_until = now + 1.5
                         else:
                             hold_until = 0.0
+
+                # ── OLED face animation requested by the phone ────────────────
+                elif cmd == 'face':
+                    anim = payload.get('anim', 'idle')
+                    if anim == 'dance':
+                        media_mode = 'music';  media_frame = 0
+                    elif anim in ('cinema_glasses', 'popcorn'):
+                        media_mode = 'video';  media_frame = 0
+                    elif anim == 'idle':
+                        media_mode = 'none'
+                        hold_until = 0.0  # release back to ambient mood
+                    else:
+                        media_mode = 'none'
+                        expr_name, hold_s = FACE_ANIM_EXPR.get(anim, ('happy', 2.0))
+                        hold_until = now + hold_s
+
+                # ── Wallet debit/credit (phone owns coin amounts) ─────────────
+                elif cmd == 'wallet':
+                    try:
+                        delta = float(payload.get('delta', 0) or 0)
+                    except Exception:
+                        delta = 0.0
+                    if delta:
+                        state.meta.money = max(0.0, state.meta.money + delta)
+                        state.save()
+                        state.save_phone_view()
+                        print(f"  wallet delta={delta:+.0f} money={state.meta.money:.0f}")
 
                 elif cmd == 'revive':
                     state.revive()

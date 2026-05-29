@@ -19,29 +19,31 @@ if TYPE_CHECKING:
 #       money (Meta.money, NOT multiplied — cost is always full)
 #       xp    (Meta.xp,   IS multiplied by effectiveness)
 
+# NOTE: money is NOT listed here. Coin costs/payouts are item- and outcome-
+# specific and only the phone knows them, so it sends an explicit `coins` delta
+# in the activity payload (and `cmd:wallet` for plain debits). The Pi applies
+# those exactly; ACTIVITY_BASE only governs Pi-owned stats + xp. The sole money
+# the engine grants on its own is the level-up bonus below.
 ACTIVITY_BASE: Dict[str, Dict[str, float]] = {
     # Feeding
     'feed_done':      {'fullness': +26.0, 'love': +4.0,  'health': +2.0,   'xp': +3.0},
-    'cook_success':   {'fullness': +30.0, 'love': +12.0, 'health': +5.0,   'money': -15.0, 'xp': +8.0},
-    'cook_burned':    {'fullness': +5.0,  'love': -8.0,                     'money': -15.0, 'xp': +1.0},
+    'cook_success':   {'fullness': +30.0, 'love': +12.0, 'health': +5.0,   'xp': +8.0},
+    'cook_burned':    {'fullness': +5.0,  'love': -8.0,                     'xp': +1.0},
     'eat':            {'fullness': +20.0, 'love': +6.0,                     'xp': +1.0},
     # Hygiene
     'wash_done':      {'love': +14.0, 'energy': +4.0, 'cleanliness': +30.0, 'health': +3.0, 'xp': +4.0},
     # Rest
     'rest_done':      {'energy': +35.0, 'fullness': -4.0, 'xp': +2.0},
-    # Entertainment — must diversify (same group → diminish)
+    # Entertainment
     'cinema_done':    {'love': +18.0, 'energy': -8.0,  'xp': +5.0},
-    'stars_done':     {'love': +14.0, 'energy': -5.0,  'xp': +4.0},
-    'reaction_done':  {'love': +10.0, 'energy': -4.0,  'xp': +3.0},
     # Exercise
     'gym_done':       {'energy': -14.0, 'love': +22.0, 'fullness': -10.0, 'health': +12.0, 'xp': +9.0},
     # Shopping
-    'market_buy':     {'love': +8.0,  'money': -10.0, 'xp': +2.0},
-    # Games — outcome-weighted via score param
-    'memory_done':    {'love': +10.0, 'energy': -5.0,  'xp': +6.0},
-    'balon_done':     {'love': +8.0,  'energy': -4.0,  'xp': +4.0},
-    'hizlimat_done':  {'love': +12.0, 'energy': -6.0,  'xp': +6.0},
-    # Play generic
+    'market_buy':     {'love': +8.0,  'xp': +2.0},
+    # Games — every mini-game reports its reward through this single canonical
+    # event (coins via the payload, stats + xp here, score-weighted). The
+    # game-specific "<name>_done" events the phone also sends are cosmetic only
+    # (OLED reaction); giving them base effects too would double-count rewards.
     'play_done':      {'love': +14.0, 'energy': -8.0,  'xp': +4.0},
 }
 
@@ -159,6 +161,25 @@ def apply_activity(state: 'EvaState', activity: str,
         state.meta.money += MONEY_LEVEL_UP
 
     state.log_activity(activity, now)
+    state.meta.total_interactions += 1
+    return applied
+
+
+def apply_effect(state: 'EvaState', effect: Dict[str, float],
+                 now: float | None = None) -> Dict[str, float]:
+    """Apply raw stat deltas the phone computed, for activities the Pi has no
+    table for (e.g. consuming an inventory item whose effect depends on the
+    item). Keys are Pi stat names (fullness/love/energy/cleanliness/health).
+    Money and xp are handled by the caller from explicit payload fields.
+    """
+    now = now or time.time()
+    applied: Dict[str, float] = {}
+    for key, delta in (effect or {}).items():
+        if hasattr(state.stats, key):
+            old = getattr(state.stats, key)
+            new_val = max(0.0, min(100.0, old + float(delta)))
+            setattr(state.stats, key, new_val)
+            applied[key] = round(new_val - old, 2)
     state.meta.total_interactions += 1
     return applied
 
